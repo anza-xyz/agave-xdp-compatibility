@@ -1,6 +1,6 @@
 # XDP Compatibility
 
-This crate provides a client-only DNS check for Agave XDP compatibility.
+This repo provides a client-only DNS check for Agave XDP compatibility.
 It sends DNS requests over agave-xdp to a public DNS resolver and validates the
 responses. If the check fails, there is likely a host/network/XDP issue.
 
@@ -21,11 +21,9 @@ sudo setcap cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon+ep target/release/xdp-
 Then run the built binary directly:
 ```
 ./target/release/xdp-compatibility \
-  --endpoint-ip <DNS resolver> \
-  --experimental-retransmit-xdp-cpu-cores <CORE> \
-  --experimental-retransmit-xdp-interface <IFACE> \
+  <DNS resolver IPv4> \
+  --xdp-cpu-cores <CPU_LIST> \
+  --xdp-interface <IFACE> \
   --timeout-ms 1000 \
-  --experimental-retransmit-xdp-zero-copy
+  --xdp-zero-copy
 ```
-
-Example: `--endpoint-ip 8.8.8.8` (Google) or `--endpoint-ip 1.1.1.1` (Cloudflare).

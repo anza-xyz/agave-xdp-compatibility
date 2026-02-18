@@ -13,13 +13,9 @@ mod linux {
         crossbeam_channel::bounded,
         log::*,
         rand::{Rng, rng},
-        solana_clap_utils::{
-            input_parsers::parse_cpu_ranges, input_validators::validate_cpu_ranges,
-        },
-        solana_net_utils::sockets::bind_to,
-        solana_turbine::xdp::master_ip_if_bonded,
         std::{
             net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+            num::ParseIntError,
             process::exit,
             sync::Arc,
             thread,
@@ -32,9 +28,26 @@ mod linux {
     const DNS_HEADER_LEN: usize = 12;
     const DNS_QUESTION_TRAILER_LEN: usize = 4; // QTYPE + QCLASS
     const DNS_MAX_LABEL_LEN: usize = 63;
+    // Pre-baked DNS query template for "solana.com" A IN.
+    // Bytes [0..2] are TXID and are patched per request.
+    const DNS_QUERY_TEMPLATE: [u8; DNS_HEADER_LEN + 16] = [
+        // Header
+        0x00, 0x00, // TXID (patched per query)
+        0x01, 0x00, // FLAGS (RD=1)
+        0x00, 0x01, // QDCOUNT
+        0x00, 0x00, // ANCOUNT
+        0x00, 0x00, // NSCOUNT
+        0x00, 0x00, // ARCOUNT
+        // Question: solana.com
+        0x06, b's', b'o', b'l', b'a', b'n', b'a', // "solana"
+        0x03, b'c', b'o', b'm', // "com"
+        0x00, // root label
+        0x00, 0x01, // QTYPE A
+        0x00, 0x01, // QCLASS IN
+    ];
 
     #[derive(Debug)]
-    struct RetransmitConfig {
+    struct XdpConfig {
         interface: Option<String>,
         cpus: Vec<usize>,
         zero_copy: bool,
@@ -42,7 +55,7 @@ mod linux {
 
     #[derive(Debug)]
     struct Config {
-        xdp_config: RetransmitConfig,
+        xdp_config: XdpConfig,
         endpoint: SocketAddr,
         timeout_ms: u64,
     }
@@ -62,38 +75,35 @@ mod linux {
     #[command(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
     struct CliArgs {
         #[arg(
-            long = "endpoint-ip",
             value_name = "IPV4",
-            default_value = "8.8.8.8",
             help = "Target endpoint IPv4 address for DNS over agave-xdp"
         )]
         endpoint_ip: Ipv4Addr,
 
         #[arg(
-            long = "experimental-retransmit-xdp-interface",
+            long = "xdp-interface",
             value_name = "INTERFACE",
-            requires = "retransmit_xdp_cpu_cores",
-            help = "EXPERIMENTAL: The network interface to use for XDP retransmit"
+            requires = "xdp_cpu_cores",
+            help = "The network interface to use for XDP"
         )]
-        retransmit_xdp_interface: Option<String>,
+        xdp_interface: Option<String>,
 
         #[arg(
-            long = "experimental-retransmit-xdp-cpu-cores",
+            long = "xdp-cpu-cores",
             value_name = "CPU_LIST",
             value_parser = |value: &str| {
-                validate_cpu_ranges(value, "--experimental-retransmit-xdp-cpu-cores")
-                    .map(|_| value.to_string())
+                parse_cpu_ranges(value).map(|_| value.to_string())
             },
-            help = "EXPERIMENTAL: Enable XDP retransmit on the specified CPU cores"
+            help = "Enable XDP on the specified CPU cores (cpuset format, for example: 0-2,7)"
         )]
-        retransmit_xdp_cpu_cores: Option<String>,
+        xdp_cpu_cores: Option<String>,
 
         #[arg(
-            long = "experimental-retransmit-xdp-zero-copy",
-            requires = "retransmit_xdp_cpu_cores",
-            help = "EXPERIMENTAL: Enable XDP zero copy. Requires hardware support"
+            long = "xdp-zero-copy",
+            requires = "xdp_cpu_cores",
+            help = "Enable XDP zero copy. Requires hardware support"
         )]
-        retransmit_xdp_zero_copy: bool,
+        xdp_zero_copy: bool,
 
         #[arg(
             long = "timeout-ms",
@@ -104,7 +114,7 @@ mod linux {
         timeout_ms: u64,
     }
 
-    fn recv_until_match(udp: &UdpSocket, request: &[u8], txid: u16, timeout_ms: u64) -> RecvResult {
+    fn recv_until_match(udp: &UdpSocket, txid: u16, timeout_ms: u64) -> RecvResult {
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(timeout_ms))
             .expect("timeout must be less than u64::MAX");
@@ -121,7 +131,7 @@ mod linux {
             match udp.recv(&mut buf) {
                 Ok(n) => {
                     saw_packet = true;
-                    match validate_dns_response(&buf[..n], request, txid) {
+                    match validate_dns_response(&buf[..n], txid) {
                         Ok(()) => return RecvResult::Match,
                         Err(DnsValidationError::Mismatch(reason)) => {
                             error!("Received mismatched DNS response for txid {txid}: {reason}");
@@ -141,76 +151,79 @@ mod linux {
         }
     }
 
-    // Build the reverse-DNS query name for an IPv4 endpoint. This lets us probe DNS using only
-    // the endpoint IP supplied by the user (no extra domain input needed).
-    pub(crate) fn reverse_ptr_qname(ip: Ipv4Addr) -> String {
-        let octets = ip.octets();
-        format!(
-            "{}.{}.{}.{}.in-addr.arpa",
-            octets[3], octets[2], octets[1], octets[0]
-        )
+    // Parse a cpu range in standard cpuset format, eg:
+    //
+    // 0-4,9
+    // 0-2,7,12-14
+    pub fn parse_cpu_ranges(data: &str) -> Result<Vec<usize>, String> {
+        data.split(',')
+            .map(|range| {
+                let mut iter = range
+                    .split('-')
+                    .map(|s| s.parse::<usize>().map_err(|ParseIntError { .. }| range));
+                let start = iter.next().unwrap()?; // str::split always returns at least one element.
+                let end = match iter.next() {
+                    None => start,
+                    Some(end) => {
+                        if iter.next().is_some() {
+                            return Err(range);
+                        }
+                        end?
+                    }
+                };
+                Ok(start..=end)
+            })
+            .try_fold(Vec::new(), |mut cpus, range| {
+                let range = range.map_err(|range| format!("--xdp-cpu-cores {range}"))?;
+                cpus.extend(range);
+                Ok(cpus)
+            })
+    }
+
+    /// Returns the IPv4 address of the master interface if the given interface is part of a bond.
+    pub fn master_ip_if_bonded(interface: &str) -> Option<Ipv4Addr> {
+        let master_ifindex_path = format!("/sys/class/net/{interface}/master/ifindex");
+        if let Ok(contents) = std::fs::read_to_string(&master_ifindex_path) {
+            let idx = contents.trim().parse().unwrap();
+            return Some(
+                NetworkDevice::new_from_index(idx)
+                    .and_then(|dev| dev.ipv4_addr())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open bond master interface for {interface}: master index \
+                             {idx}: {e}"
+                        )
+                    }),
+            );
+        }
+        None
     }
 
     // Send one DNS query on the kernel UDP path before XDP traffic. This primes route/neighbor/NAT
     // state so first-packet behavior is less likely to hide XDP issues.
-    fn warm_up_dns_path(udp: &UdpSocket, endpoint_ip: Ipv4Addr, timeout_ms: u64) {
+    fn warm_up_dns_path(udp: &UdpSocket, timeout_ms: u64) {
         let warmup_txid = random_txid();
-        let qname = reverse_ptr_qname(endpoint_ip);
-        let Some(warmup_payload) = build_dns_query(warmup_txid, &qname) else {
-            warn!("Skipping DNS warmup: failed to build warmup query");
-            return;
-        };
+        let warmup_payload = build_dns_query(warmup_txid);
         if let Err(err) = udp.send(&warmup_payload) {
-            warn!("DNS warmup send failed: {err}");
-            return;
+            panic!("DNS warmup failed to send query: {err}");
         }
-        match recv_until_match(udp, &warmup_payload, warmup_txid, timeout_ms) {
+        match recv_until_match(udp, warmup_txid, timeout_ms) {
             RecvResult::Match => {
                 debug!("DNS warmup on kernel UDP path succeeded");
             }
             RecvResult::Mismatch => {
-                warn!("DNS warmup got malformed response; continuing with XDP test");
+                panic!("DNS warmup failed: received mismatched or malformed DNS response");
             }
             RecvResult::Timeout => {
-                warn!("DNS warmup timed out; continuing with XDP test");
+                panic!("DNS warmup failed: timed out waiting for DNS response");
             }
         }
     }
 
-    fn encode_qname(name: &str) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        for label in name.split('.') {
-            let len = u8::try_from(label.len()).ok()?;
-            // DNS names are encoded as a sequence of length-prefixed labels.
-            out.push(len);
-            out.extend_from_slice(label.as_bytes());
-        }
-        // Zero-length label terminates the QNAME
-        out.push(0);
-        Some(out)
-    }
-
-    pub(crate) fn build_dns_query(txid: u16, qname: &str) -> Option<Vec<u8>> {
-        // DNS query wire layout:
-        // Header (12 bytes): ID | FLAGS | QDCOUNT | ANCOUNT | NSCOUNT | ARCOUNT
-        // Question: QNAME | QTYPE | QCLASS
-        // FLAGS bit layout (MSB -> LSB):
-        // QR(15) | OPCODE(14-11) | AA(10) | TC(9) | RD(8) | RA(7) | Z(6-4) | RCODE(3-0)
-        let encoded_qname = encode_qname(qname)?;
-        let mut dns_bytes: Vec<u8> =
-            Vec::with_capacity(DNS_HEADER_LEN + encoded_qname.len() + DNS_QUESTION_TRAILER_LEN);
-        dns_bytes.extend_from_slice(&txid.to_be_bytes());
-        // Standard DNS query with recursion-desired set.
-        dns_bytes.extend_from_slice(&0x0100u16.to_be_bytes());
-        dns_bytes.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-        dns_bytes.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
-        dns_bytes.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-        dns_bytes.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-        // Question section: QNAME | QTYPE | QCLASS
-        dns_bytes.extend_from_slice(&encoded_qname); // QNAME
-        dns_bytes.extend_from_slice(&12u16.to_be_bytes()); // QTYPE
-        dns_bytes.extend_from_slice(&1u16.to_be_bytes()); // QCLASS
-        Some(dns_bytes)
+    pub(crate) fn build_dns_query(txid: u16) -> Vec<u8> {
+        let mut dns_bytes = DNS_QUERY_TEMPLATE;
+        dns_bytes[0..2].copy_from_slice(&txid.to_be_bytes());
+        dns_bytes.to_vec()
     }
 
     pub(crate) fn dns_question_end(packet: &[u8]) -> Option<usize> {
@@ -238,7 +251,6 @@ mod linux {
 
     pub(crate) fn validate_dns_response(
         packet: &[u8],
-        request: &[u8],
         txid: u16,
     ) -> Result<(), DnsValidationError> {
         if packet.len() < DNS_HEADER_LEN {
@@ -265,11 +277,10 @@ mod linux {
         if ancount == 0 {
             return Err(DnsValidationError::Mismatch("no answers in response"));
         }
-        // Require the echoed question to match exactly so we know the answer corresponds to our
-        // endpoint-derived PTR query.
+        // Require the echoed question to match our pre-baked solana.com A/IN question.
         let resp_q_end = dns_question_end(packet)
             .ok_or(DnsValidationError::Mismatch("invalid response question"))?;
-        let request_question = &request[DNS_HEADER_LEN..];
+        let request_question = &DNS_QUERY_TEMPLATE[DNS_HEADER_LEN..];
         let response_question = &packet[DNS_HEADER_LEN..resp_q_end];
         if request_question != response_question {
             return Err(DnsValidationError::Mismatch("question mismatch"));
@@ -284,20 +295,19 @@ mod linux {
 
     fn parse_args() -> Config {
         let args = CliArgs::parse();
-
-        let cpus = if let Some(cpu_list) = args.retransmit_xdp_cpu_cores.as_deref() {
+        let cpus = if let Some(cpu_list) = args.xdp_cpu_cores.as_deref() {
             parse_cpu_ranges(cpu_list).unwrap_or_else(|err| {
-                error!("--experimental-retransmit-xdp-cpu-cores {err}");
+                error!("{err}");
                 exit(1);
             })
         } else {
             vec![0]
         };
 
-        let xdp_config = RetransmitConfig {
-            interface: args.retransmit_xdp_interface,
+        let xdp_config = XdpConfig {
+            interface: args.xdp_interface,
             cpus,
-            zero_copy: args.retransmit_xdp_zero_copy,
+            zero_copy: args.xdp_zero_copy,
         };
         Config {
             xdp_config,
@@ -363,7 +373,7 @@ mod linux {
             exit(1);
         };
         // Bind a UDP socket to receive DNS responses from the endpoint.
-        let udp = bind_to(IpAddr::V4(local_ip), 0).unwrap_or_else(|e| {
+        let udp = UdpSocket::bind((local_ip, 0)).unwrap_or_else(|e| {
             error!("Failed to bind UDP socket: {e}");
             exit(1);
         });
@@ -374,11 +384,11 @@ mod linux {
             exit(1);
         });
         // Warm up route/neighbor/NAT state with a normal UDP DNS exchange.
-        warm_up_dns_path(&udp, endpoint_ip, config.timeout_ms);
+        warm_up_dns_path(&udp, config.timeout_ms);
 
         let (sender, receiver) = bounded::<(Vec<SocketAddr>, Vec<u8>)>(1);
         let cpu_id = xdp_config.cpus.first().copied().unwrap_or_else(|| {
-            error!("No CPU core configured for XDP retransmit.");
+            error!("No CPU core configured for XDP.");
             exit(1);
         });
         if xdp_config.cpus.len() > 1 {
@@ -410,14 +420,10 @@ mod linux {
             );
         });
 
-        let qname = reverse_ptr_qname(endpoint_ip);
         let txid = random_txid();
-        let payload = build_dns_query(txid, &qname).unwrap_or_else(|| {
-            error!("Failed to build DNS query for {qname}");
-            exit(1);
-        });
+        let payload = build_dns_query(txid);
         sender.send((vec![endpoint], payload.clone())).unwrap();
-        let result = recv_until_match(&udp, &payload, txid, config.timeout_ms);
+        let result = recv_until_match(&udp, txid, config.timeout_ms);
 
         drop(sender);
         let _ = tx_thread.join();
@@ -454,12 +460,8 @@ fn main() {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use {
-        crate::linux::{
-            DnsValidationError, build_dns_query, dns_question_end, reverse_ptr_qname,
-            validate_dns_response,
-        },
-        std::net::Ipv4Addr,
+    use crate::linux::{
+        DnsValidationError, build_dns_query, dns_question_end, validate_dns_response,
     };
 
     fn header_u16(packet: &[u8], offset: usize) -> u16 {
@@ -476,16 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn reverse_ptr_qname_is_encoded_in_reverse_octet_order() {
-        let qname = reverse_ptr_qname(Ipv4Addr::new(1, 2, 3, 4));
-        assert_eq!(qname, "4.3.2.1.in-addr.arpa");
-    }
-
-    #[test]
     fn build_dns_query_sets_expected_header_and_question_fields() {
         let txid = 0x1234;
-        let qname = reverse_ptr_qname(Ipv4Addr::new(8, 8, 4, 4));
-        let packet = build_dns_query(txid, &qname).expect("valid qname should encode");
+        let packet = build_dns_query(txid);
 
         assert_eq!(header_u16(&packet, 0), txid);
         assert_eq!(header_u16(&packet, 2), 0x0100); // RD set
@@ -495,15 +490,14 @@ mod tests {
         assert_eq!(header_u16(&packet, 10), 0); // ARCOUNT
 
         let q_end = dns_question_end(&packet).expect("request question should be well-formed");
-        assert_eq!(header_u16(&packet, q_end - 4), 12); // QTYPE PTR
+        assert_eq!(header_u16(&packet, q_end - 4), 1); // QTYPE A
         assert_eq!(header_u16(&packet, q_end - 2), 1); // QCLASS IN
     }
 
     #[test]
     fn dns_question_end_rejects_truncated_qname() {
         let txid = 0x4242;
-        let qname = reverse_ptr_qname(Ipv4Addr::new(1, 1, 1, 1));
-        let mut packet = build_dns_query(txid, &qname).expect("query build succeeds");
+        let mut packet = build_dns_query(txid);
         packet.pop(); // truncate final QCLASS byte
         assert!(dns_question_end(&packet).is_none());
     }
@@ -511,20 +505,18 @@ mod tests {
     #[test]
     fn validate_dns_response_accepts_matching_response() {
         let txid = 0x1001;
-        let qname = reverse_ptr_qname(Ipv4Addr::new(9, 9, 9, 9));
-        let request = build_dns_query(txid, &qname).expect("query build succeeds");
+        let request = build_dns_query(txid);
         let response = make_response_from_request(&request, txid);
-        assert!(validate_dns_response(&response, &request, txid).is_ok());
+        assert!(validate_dns_response(&response, txid).is_ok());
     }
 
     #[test]
     fn validate_dns_response_ignores_wrong_txid() {
         let txid = 0x1001;
-        let qname = reverse_ptr_qname(Ipv4Addr::new(9, 9, 9, 9));
-        let request = build_dns_query(txid, &qname).expect("query build succeeds");
+        let request = build_dns_query(txid);
         let response = make_response_from_request(&request, txid.wrapping_add(1));
         assert!(matches!(
-            validate_dns_response(&response, &request, txid),
+            validate_dns_response(&response, txid),
             Err(DnsValidationError::TxidMismatch)
         ));
     }
@@ -532,13 +524,11 @@ mod tests {
     #[test]
     fn validate_dns_response_flags_question_mismatch() {
         let txid = 0x1001;
-        let qname = reverse_ptr_qname(Ipv4Addr::new(9, 9, 9, 9));
-        let request = build_dns_query(txid, &qname).expect("query build succeeds");
-        let other_qname = reverse_ptr_qname(Ipv4Addr::new(1, 0, 0, 127));
-        let other = build_dns_query(txid, &other_qname).expect("query build succeeds");
+        let mut other = build_dns_query(txid);
+        other[17] ^= 0x01; // mutate one byte in QNAME ("solana.com") while keeping wire format valid.
         let response = make_response_from_request(&other, txid);
         assert!(matches!(
-            validate_dns_response(&response, &request, txid),
+            validate_dns_response(&response, txid),
             Err(DnsValidationError::Mismatch("question mismatch"))
         ));
     }
