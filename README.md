@@ -12,17 +12,18 @@ Please report failures in the Solana Discord in `#validator-support`, with:
 
 ## Usage
 
-For XDP zero-copy, the client binary needs extra capabilities. Build it and set caps:
+The client binary needs capabilities. Built it and set caps:
 ```
 cargo build --release -p xdp-compatibility
-sudo setcap cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon+ep target/release/xdp-compatibility
+sudo setcap cap_net_admin,cap_net_raw,cap_bpf+ep target/release/xdp-compatibility
+# For --xdp-zero-copy, include cap_perfmon as well:
+# sudo setcap cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon+ep target/release/xdp-compatibility
 ```
 
 Then run the built binary directly:
 ```
 ./target/release/xdp-compatibility \
   <DNS resolver IPv4> \
-  --xdp-cpu-cores <CPU_LIST> \
   --xdp-interface <IFACE> \
   --timeout-ms 1000 \
   --xdp-zero-copy
