@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "agave-xdp"
-version = "3.1.8"
+version = "3.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3628b42edb7c649ce2feb2b8b3dacb05951010fbee3f36688c9ae0e26a3e5c47"
+checksum = "fd0683fab6e2cb54b4a28d821e3f631a4e6bb2bdf64cc9106898bf20a271f3ae"
 dependencies = [
  "agave-xdp-ebpf",
  "aya",
@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "agave-xdp-ebpf"
-version = "3.1.8"
+version = "3.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e793c8cedd0cbc84a9e95f35f1d25991075fca42900f47211aa8708e0d4da23a"
+checksum = "d7026b65e3016add732498f5b654aed89760f8d54f7ef6f9a827a26cbac0c6aa"
 dependencies = [
  "aya",
  "aya-ebpf",
