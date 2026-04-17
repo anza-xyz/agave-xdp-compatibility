@@ -1,7 +1,8 @@
 use {
     agave_xdp::{
         device::{NetworkDevice, QueueId},
-        tx_loop::tx_loop,
+        route::Router,
+        tx_loop::{TxLoopBuilder, TxLoopConfigBuilder},
     },
     caps::{
         CapSet,
@@ -332,6 +333,21 @@ fn main() {
     let src_port = udp.local_addr().unwrap().port();
     let dev = Arc::new(dev);
 
+    // Build the router for XDP packet routing.
+    let router = Router::new().unwrap_or_else(|e| {
+        error!("Failed to initialize routing tables: {e}");
+        exit(1);
+    });
+
+    // Build the TxLoop configuration using the new builder API.
+    let mut tx_config_builder = TxLoopConfigBuilder::new(src_port);
+    tx_config_builder.zero_copy(zero_copy);
+    tx_config_builder.override_src_ip(local_ip);
+    let tx_config = tx_config_builder.build_with_src_device(&dev);
+
+    let queue_id = QueueId(cpu_id as u64);
+    let tx_loop = TxLoopBuilder::new(cpu_id, queue_id, tx_config, &dev).build();
+
     if zero_copy {
         for cap in [CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF, CAP_PERFMON] {
             let _ = caps::drop(None, CapSet::Effective, cap);
@@ -341,18 +357,10 @@ fn main() {
     let (drop_sender, _drop_receiver) = bounded(1);
 
     let tx_thread = thread::spawn(move || {
-        tx_loop(
-            cpu_id,
-            dev.as_ref(),
-            QueueId(cpu_id as u64),
-            zero_copy,
-            None,
-            Some(local_ip),
-            src_port,
-            None,
-            receiver,
-            drop_sender,
-        );
+        tx_loop.run(receiver, drop_sender, |ip| router.route_v4(match ip {
+            IpAddr::V4(v4) => *v4,
+            IpAddr::V6(_) => return None,
+        }).ok());
     });
 
     let txid = random_txid();
