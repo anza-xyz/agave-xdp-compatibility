@@ -28,3 +28,6 @@ Then run the built binary directly:
   --timeout-ms 1000 \
   --xdp-zero-copy
 ```
+
+If you observe issues, follow the troubleshooting guidelines from https://www.anza.xyz/blog/agave-xdp-setup-guide.
+If it still does not work, the same document contains instructions for reporting issues.
